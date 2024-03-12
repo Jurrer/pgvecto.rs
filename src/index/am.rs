@@ -1,12 +1,15 @@
+#![allow(unsafe_op_in_unsafe_fn)]
+
 use super::am_build;
 use super::am_scan;
 use super::am_setup;
 use super::am_update;
-use crate::gucs::ENABLE_VECTOR_INDEX;
+use crate::gucs::planning::ENABLE_INDEX;
 use crate::index::utils::from_datum;
 use crate::prelude::*;
 use crate::utils::cells::PgCell;
-use service::prelude::*;
+use pgrx::datum::Internal;
+use pgrx::pg_sys::Datum;
 
 static RELOPT_KIND: PgCell<pgrx::pg_sys::relopt_kind> = unsafe { PgCell::new(0) };
 
@@ -19,24 +22,19 @@ pub unsafe fn init() {
         "".as_pg_cstr(),
         "".as_pg_cstr(),
         None,
-        #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15", feature = "pg16"))]
-        {
-            pgrx::pg_sys::AccessExclusiveLock as pgrx::pg_sys::LOCKMODE
-        },
+        pgrx::pg_sys::AccessExclusiveLock as pgrx::pg_sys::LOCKMODE,
     );
 }
 
-#[pgrx::pg_extern(sql = "
-    CREATE OR REPLACE FUNCTION vectors_amhandler(internal) RETURNS index_am_handler
-    PARALLEL SAFE IMMUTABLE STRICT LANGUAGE c AS 'MODULE_PATHNAME', '@FUNCTION_NAME@';
-", requires = ["vecf32"])]
-fn vectors_amhandler(
-    _fcinfo: pgrx::pg_sys::FunctionCallInfo,
-) -> pgrx::PgBox<pgrx::pg_sys::IndexAmRoutine> {
+#[pgrx::pg_extern(sql = "\
+CREATE FUNCTION _vectors_amhandler(internal) RETURNS index_am_handler
+IMMUTABLE STRICT PARALLEL SAFE LANGUAGE c AS 'MODULE_PATHNAME', '@FUNCTION_NAME@';")]
+fn _vectors_amhandler(_fcinfo: pgrx::pg_sys::FunctionCallInfo) -> Internal {
+    type T = pgrx::pg_sys::IndexAmRoutine;
     unsafe {
-        let mut am_routine = pgrx::PgBox::<pgrx::pg_sys::IndexAmRoutine>::alloc0();
-        *am_routine = AM_HANDLER;
-        am_routine.into_pg_boxed()
+        let index_am_routine = pgrx::pg_sys::palloc0(std::mem::size_of::<T>()) as *mut T;
+        index_am_routine.write(AM_HANDLER);
+        Internal::from(Some(Datum::from(index_am_routine)))
     }
 }
 
@@ -88,48 +86,8 @@ pub unsafe extern "C" fn amvalidate(opclass_oid: pgrx::pg_sys::Oid) -> bool {
     true
 }
 
-#[cfg(feature = "pg12")]
 #[pgrx::pg_guard]
-pub unsafe extern "C" fn amoptions(
-    reloptions: pgrx::pg_sys::Datum,
-    validate: bool,
-) -> *mut pgrx::pg_sys::bytea {
-    use pgrx::pg_sys::AsPgCStr;
-    let tab: &[pgrx::pg_sys::relopt_parse_elt] = &[pgrx::pg_sys::relopt_parse_elt {
-        optname: "options".as_pg_cstr(),
-        opttype: pgrx::pg_sys::relopt_type_RELOPT_TYPE_STRING,
-        offset: am_setup::helper_offset() as i32,
-    }];
-    let mut noptions = 0;
-    let options =
-        pgrx::pg_sys::parseRelOptions(reloptions, validate, RELOPT_KIND.get(), &mut noptions);
-    if noptions == 0 {
-        return std::ptr::null_mut();
-    }
-    for relopt in std::slice::from_raw_parts_mut(options, noptions as usize) {
-        relopt.gen.as_mut().unwrap().lockmode =
-            pgrx::pg_sys::AccessExclusiveLock as pgrx::pg_sys::LOCKMODE;
-    }
-    let rdopts = pgrx::pg_sys::allocateReloptStruct(am_setup::helper_size(), options, noptions);
-    pgrx::pg_sys::fillRelOptions(
-        rdopts,
-        am_setup::helper_size(),
-        options,
-        noptions,
-        validate,
-        tab.as_ptr(),
-        tab.len() as i32,
-    );
-    pgrx::pg_sys::pfree(options as pgrx::void_mut_ptr);
-    rdopts as *mut pgrx::pg_sys::bytea
-}
-
-#[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15", feature = "pg16"))]
-#[pgrx::pg_guard]
-pub unsafe extern "C" fn amoptions(
-    reloptions: pgrx::pg_sys::Datum,
-    validate: bool,
-) -> *mut pgrx::pg_sys::bytea {
+pub unsafe extern "C" fn amoptions(reloptions: Datum, validate: bool) -> *mut pgrx::pg_sys::bytea {
     use pgrx::pg_sys::AsPgCStr;
 
     let tab: &[pgrx::pg_sys::relopt_parse_elt] = &[pgrx::pg_sys::relopt_parse_elt {
@@ -159,7 +117,7 @@ pub unsafe extern "C" fn amcostestimate(
     index_correlation: *mut f64,
     index_pages: *mut f64,
 ) {
-    if (*path).indexorderbys.is_null() || !ENABLE_VECTOR_INDEX.get() {
+    if (*path).indexorderbys.is_null() || !ENABLE_INDEX.get() {
         *index_startup_cost = f64::MAX;
         *index_total_cost = f64::MAX;
         *index_selectivity = 0.0;
@@ -193,30 +151,11 @@ pub unsafe extern "C" fn ambuildempty(index_relation: pgrx::pg_sys::Relation) {
     am_build::build(index_relation, None);
 }
 
-#[cfg(any(feature = "pg12", feature = "pg13"))]
 #[pgrx::pg_guard]
 pub unsafe extern "C" fn aminsert(
     index_relation: pgrx::pg_sys::Relation,
-    values: *mut pgrx::pg_sys::Datum,
-    _is_null: *mut bool,
-    heap_tid: pgrx::pg_sys::ItemPointer,
-    _heap_relation: pgrx::pg_sys::Relation,
-    _check_unique: pgrx::pg_sys::IndexUniqueCheck,
-    _index_info: *mut pgrx::pg_sys::IndexInfo,
-) -> bool {
-    let oid = (*index_relation).rd_node.relNode;
-    let id = Id::from_sys(oid);
-    let vector = from_datum(*values.add(0));
-    am_update::update_insert(id, vector, *heap_tid);
-    true
-}
-
-#[cfg(any(feature = "pg14", feature = "pg15", feature = "pg16"))]
-#[pgrx::pg_guard]
-pub unsafe extern "C" fn aminsert(
-    index_relation: pgrx::pg_sys::Relation,
-    values: *mut pgrx::pg_sys::Datum,
-    _is_null: *mut bool,
+    values: *mut Datum,
+    is_null: *mut bool,
     heap_tid: pgrx::pg_sys::ItemPointer,
     _heap_relation: pgrx::pg_sys::Relation,
     _check_unique: pgrx::pg_sys::IndexUniqueCheck,
@@ -227,9 +166,11 @@ pub unsafe extern "C" fn aminsert(
     let oid = (*index_relation).rd_node.relNode;
     #[cfg(feature = "pg16")]
     let oid = (*index_relation).rd_locator.relNumber;
-    let id = Id::from_sys(oid);
-    let vector = from_datum(*values.add(0));
-    am_update::update_insert(id, vector, *heap_tid);
+    let id = Handle::from_sys(oid);
+    let vector = from_datum(*values.add(0), *is_null.add(0));
+    if let Some(v) = vector {
+        am_update::update_insert(id, v, *heap_tid);
+    }
     true
 }
 
@@ -280,11 +221,11 @@ pub unsafe extern "C" fn ambulkdelete(
     callback: pgrx::pg_sys::IndexBulkDeleteCallback,
     callback_state: *mut std::os::raw::c_void,
 ) -> *mut pgrx::pg_sys::IndexBulkDeleteResult {
-    #[cfg(any(feature = "pg12", feature = "pg13", feature = "pg14", feature = "pg15"))]
+    #[cfg(any(feature = "pg14", feature = "pg15"))]
     let oid = (*(*info).index).rd_node.relNode;
     #[cfg(feature = "pg16")]
     let oid = (*(*info).index).rd_locator.relNumber;
-    let id = Id::from_sys(oid);
+    let id = Handle::from_sys(oid);
     if let Some(callback) = callback {
         am_update::update_delete(id, |pointer| {
             callback(

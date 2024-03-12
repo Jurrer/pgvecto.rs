@@ -1,31 +1,37 @@
-use crate::index::hook_transaction::flush_if_commit;
+use crate::index::hook_transaction::callback_dirty;
 use crate::prelude::*;
-use service::prelude::*;
 
-pub fn update_insert(id: Id, vector: DynamicVector, tid: pgrx::pg_sys::ItemPointerData) {
-    flush_if_commit(id);
-    let p = Pointer::from_sys(tid);
-    let mut rpc = crate::ipc::client::borrow_mut();
-    rpc.insert(id, (vector, p));
+pub fn update_insert(handle: Handle, vector: OwnedVector, tid: pgrx::pg_sys::ItemPointerData) {
+    callback_dirty(handle);
+
+    let pointer = Pointer::from_sys(tid);
+    let mut rpc = check_client(crate::ipc::client());
+
+    match rpc.insert(handle, vector, pointer) {
+        Ok(()) => (),
+        Err(InsertError::NotExist) => bad_service_not_exist(),
+        Err(InsertError::Upgrade) => bad_service_upgrade(),
+        Err(InsertError::InvalidVector) => bad_service_invalid_vector(),
+    }
 }
 
-pub fn update_delete(id: Id, hook: impl Fn(Pointer) -> bool) {
-    struct Delete<H> {
-        hook: H,
-    }
+pub fn update_delete(handle: Handle, f: impl Fn(Pointer) -> bool) {
+    callback_dirty(handle);
 
-    impl<H> crate::ipc::client::Delete for Delete<H>
-    where
-        H: Fn(Pointer) -> bool,
-    {
-        fn test(&mut self, p: Pointer) -> bool {
-            (self.hook)(p)
+    let mut rpc_list = match check_client(crate::ipc::client()).list(handle) {
+        Ok(x) => x,
+        Err((_, ListError::NotExist)) => bad_service_not_exist(),
+        Err((_, ListError::Upgrade)) => bad_service_upgrade(),
+    };
+    let mut rpc = check_client(crate::ipc::client());
+    while let Some(p) = rpc_list.next() {
+        if f(p) {
+            match rpc.delete(handle, p) {
+                Ok(()) => (),
+                Err(DeleteError::NotExist) => (),
+                Err(DeleteError::Upgrade) => (),
+            }
         }
     }
-
-    let client_delete = Delete { hook };
-
-    flush_if_commit(id);
-    let mut rpc = crate::ipc::client::borrow_mut();
-    rpc.delete(id, client_delete);
+    rpc_list.leave();
 }

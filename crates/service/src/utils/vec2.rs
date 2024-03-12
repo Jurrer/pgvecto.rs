@@ -1,24 +1,29 @@
-use crate::prelude::*;
+use bytemuck::Zeroable;
 use std::ops::{Deref, DerefMut, Index, IndexMut};
 
 #[derive(Debug, Clone)]
-pub struct Vec2<S: G> {
-    dims: u16,
-    v: Vec<S::Scalar>,
+pub struct Vec2<T> {
+    dims: u32,
+    v: Vec<T>,
 }
 
-impl<S: G> Vec2<S> {
-    pub fn new(dims: u16, n: usize) -> Self {
+impl<T: Zeroable + Ord> Vec2<T> {
+    pub fn new(dims: u32, n: usize) -> Self {
         Self {
             dims,
             v: bytemuck::zeroed_vec(dims as usize * n),
         }
     }
-    pub fn dims(&self) -> u16 {
+    pub fn dims(&self) -> u32 {
         self.dims
     }
     pub fn len(&self) -> usize {
         self.v.len() / self.dims as usize
+    }
+    pub fn argsort(&self) -> Vec<usize> {
+        let mut index: Vec<usize> = (0..self.len()).collect();
+        index.sort_by_key(|i| &self[*i]);
+        index
     }
     pub fn copy_within(&mut self, i: usize, j: usize) {
         assert!(i < self.len() && j < self.len());
@@ -32,29 +37,29 @@ impl<S: G> Vec2<S> {
     }
 }
 
-impl<S: G> Index<usize> for Vec2<S> {
-    type Output = [S::Scalar];
+impl<T> Index<usize> for Vec2<T> {
+    type Output = [T];
 
     fn index(&self, index: usize) -> &Self::Output {
         &self.v[self.dims as usize * index..][..self.dims as usize]
     }
 }
 
-impl<S: G> IndexMut<usize> for Vec2<S> {
+impl<T> IndexMut<usize> for Vec2<T> {
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
         &mut self.v[self.dims as usize * index..][..self.dims as usize]
     }
 }
 
-impl<S: G> Deref for Vec2<S> {
-    type Target = [S::Scalar];
+impl<T> Deref for Vec2<T> {
+    type Target = [T];
 
     fn deref(&self) -> &Self::Target {
         self.v.deref()
     }
 }
 
-impl<S: G> DerefMut for Vec2<S> {
+impl<T> DerefMut for Vec2<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.v.deref_mut()
     }

@@ -1,7 +1,4 @@
-#![allow(clippy::all)] // Clippy bug.
-
 use super::SegmentTracker;
-use crate::index::IndexOptions;
 use crate::index::IndexTracker;
 use crate::prelude::*;
 use crate::utils::dir_ops::sync_dir;
@@ -9,10 +6,11 @@ use crate::utils::file_wal::FileWal;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::cell::UnsafeCell;
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::mem::MaybeUninit;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
 use uuid::Uuid;
@@ -43,6 +41,7 @@ impl<S: G> GrowingSegment<S> {
         sync_dir(&path);
         Arc::new(Self {
             uuid,
+            #[allow(clippy::uninit_vec)]
             vec: unsafe {
                 let mut vec = Vec::with_capacity(capacity as usize);
                 vec.set_len(capacity as usize);
@@ -57,7 +56,13 @@ impl<S: G> GrowingSegment<S> {
             _tracker: Arc::new(SegmentTracker { path, _tracker }),
         })
     }
-    pub fn open(_tracker: Arc<IndexTracker>, path: PathBuf, uuid: Uuid) -> Arc<Self> {
+
+    pub fn open(
+        _tracker: Arc<IndexTracker>,
+        path: PathBuf,
+        uuid: Uuid,
+        _: IndexOptions,
+    ) -> Arc<Self> {
         let mut wal = FileWal::open(path.join("wal"));
         let mut vec = Vec::new();
         while let Some(log) = wal.read() {
@@ -78,9 +83,11 @@ impl<S: G> GrowingSegment<S> {
             _tracker: Arc::new(SegmentTracker { path, _tracker }),
         })
     }
+
     pub fn uuid(&self) -> Uuid {
         self.uuid
     }
+
     pub fn is_full(&self) -> bool {
         let n;
         {
@@ -95,6 +102,7 @@ impl<S: G> GrowingSegment<S> {
         }
         true
     }
+
     pub fn seal(&self) {
         let n;
         {
@@ -107,12 +115,14 @@ impl<S: G> GrowingSegment<S> {
         }
         self.wal.lock().sync_all();
     }
+
     pub fn flush(&self) {
         self.wal.lock().sync_all();
     }
+
     pub fn insert(
         &self,
-        vector: Vec<S::Scalar>,
+        vector: S::VectorOwned,
         payload: Payload,
     ) -> Result<(), GrowingSegmentInsertError> {
         let log = Log { vector, payload };
@@ -137,17 +147,38 @@ impl<S: G> GrowingSegment<S> {
             .write(&bincode::serialize::<Log<S>>(&log).unwrap());
         Ok(())
     }
+
     pub fn len(&self) -> u32 {
         self.len.load(Ordering::Acquire) as u32
     }
-    pub fn vector(&self, i: u32) -> &[S::Scalar] {
+
+    pub fn stat_growing(&self) -> SegmentStat {
+        SegmentStat {
+            id: self.uuid,
+            typ: "growing".to_string(),
+            length: self.len() as usize,
+            size: (self.len() as u64) * (std::mem::size_of::<Log<S>>() as u64),
+        }
+    }
+
+    pub fn stat_write(&self) -> SegmentStat {
+        SegmentStat {
+            id: self.uuid,
+            typ: "write".to_string(),
+            length: self.len() as usize,
+            size: (self.len() as u64) * (std::mem::size_of::<Log<S>>() as u64),
+        }
+    }
+
+    pub fn vector(&self, i: u32) -> Borrowed<'_, S> {
         let i = i as usize;
         if i >= self.len.load(Ordering::Acquire) {
             panic!("Out of bound.");
         }
         let log = unsafe { (*self.vec[i].get()).assume_init_ref() };
-        log.vector.as_ref()
+        log.vector.for_borrow()
     }
+
     pub fn payload(&self, i: u32) -> Payload {
         let i = i as usize;
         if i >= self.len.load(Ordering::Acquire) {
@@ -156,33 +187,47 @@ impl<S: G> GrowingSegment<S> {
         let log = unsafe { (*self.vec[i].get()).assume_init_ref() };
         log.payload
     }
-    pub fn search(&self, k: usize, vector: &[S::Scalar], filter: &mut impl Filter) -> Heap {
+
+    pub fn basic(
+        &self,
+        vector: Borrowed<'_, S>,
+        _opts: &SearchOptions,
+        mut filter: impl Filter,
+    ) -> BinaryHeap<Reverse<Element>> {
         let n = self.len.load(Ordering::Acquire);
-        let mut heap = Heap::new(k);
+        let mut result = BinaryHeap::new();
         for i in 0..n {
             let log = unsafe { (*self.vec[i].get()).assume_init_ref() };
-            let distance = S::distance(vector, &log.vector);
-            if heap.check(distance) && filter.check(log.payload) {
-                heap.push(HeapElement {
+            if filter.check(log.payload) {
+                let distance = S::distance(vector, log.vector.for_borrow());
+                result.push(Reverse(Element {
+                    distance,
+                    payload: log.payload,
+                }));
+            }
+        }
+        result
+    }
+
+    pub fn vbase<'a>(
+        &'a self,
+        vector: Borrowed<'a, S>,
+        _opts: &SearchOptions,
+        mut filter: impl Filter + 'a,
+    ) -> (Vec<Element>, Box<dyn Iterator<Item = Element> + 'a>) {
+        let n = self.len.load(Ordering::Acquire);
+        let mut result = Vec::new();
+        for i in 0..n {
+            let log = unsafe { (*self.vec[i].get()).assume_init_ref() };
+            if filter.check(log.payload) {
+                let distance = S::distance(vector, log.vector.for_borrow());
+                result.push(Element {
                     distance,
                     payload: log.payload,
                 });
             }
         }
-        heap
-    }
-    pub fn vbase(&self, vector: &[S::Scalar]) -> Vec<HeapElement> {
-        let n = self.len.load(Ordering::Acquire);
-        let mut result = Vec::new();
-        for i in 0..n {
-            let log = unsafe { (*self.vec[i].get()).assume_init_ref() };
-            let distance = S::distance(vector, &log.vector);
-            result.push(HeapElement {
-                distance,
-                payload: log.payload,
-            });
-        }
-        result
+        (result, Box::new(std::iter::empty()))
     }
 }
 
@@ -202,7 +247,7 @@ impl<S: G> Drop for GrowingSegment<S> {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Log<S: G> {
-    vector: Vec<S::Scalar>,
+    vector: S::VectorOwned,
     payload: Payload,
 }
 

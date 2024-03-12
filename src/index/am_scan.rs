@@ -1,25 +1,26 @@
-use crate::gucs::ENABLE_PREFILTER;
-use crate::gucs::ENABLE_VBASE;
-use crate::gucs::K;
+#![allow(unsafe_op_in_unsafe_fn)]
+
+use crate::gucs::executing::search_options;
+use crate::gucs::planning::Mode;
+use crate::gucs::planning::SEARCH_MODE;
 use crate::index::utils::from_datum;
-use crate::ipc::client::ClientGuard;
-use crate::ipc::client::Vbase;
+use crate::ipc::{ClientBasic, ClientVbase};
 use crate::prelude::*;
+use pgrx::pg_sys::SK_ISNULL;
 use pgrx::FromDatum;
-use service::prelude::*;
 
 pub enum Scanner {
     Initial {
         node: Option<*mut pgrx::pg_sys::IndexScanState>,
-        vector: Option<DynamicVector>,
+        vector: Option<OwnedVector>,
     },
-    Search {
+    Basic {
         node: *mut pgrx::pg_sys::IndexScanState,
-        data: Vec<Pointer>,
+        basic: ClientBasic,
     },
     Vbase {
         node: *mut pgrx::pg_sys::IndexScanState,
-        vbase: ClientGuard<Vbase>,
+        vbase: ClientVbase,
     },
 }
 
@@ -27,7 +28,7 @@ impl Scanner {
     fn node(&self) -> Option<*mut pgrx::pg_sys::IndexScanState> {
         match self {
             Scanner::Initial { node, .. } => *node,
-            Scanner::Search { node, .. } => Some(*node),
+            Scanner::Basic { node, .. } => Some(*node),
             Scanner::Vbase { node, .. } => Some(*node),
         }
     }
@@ -60,21 +61,23 @@ pub unsafe fn make_scan(index_relation: pgrx::pg_sys::Relation) -> pgrx::pg_sys:
 
 pub unsafe fn start_scan(scan: pgrx::pg_sys::IndexScanDesc, orderbys: pgrx::pg_sys::ScanKey) {
     std::ptr::copy(orderbys, (*scan).orderByData, 1);
-
-    let vector = from_datum((*orderbys.add(0)).sk_argument);
+    let is_null = (SK_ISNULL & (*orderbys.add(0)).sk_flags as u32) != 0;
+    let vector = from_datum((*orderbys.add(0)).sk_argument, is_null);
 
     let scanner = &mut *((*scan).opaque as *mut Scanner);
     let scanner = std::mem::replace(
         scanner,
         Scanner::Initial {
             node: scanner.node(),
-            vector: Some(vector),
+            vector,
         },
     );
 
     match scanner {
         Scanner::Initial { .. } => {}
-        Scanner::Search { .. } => {}
+        Scanner::Basic { basic, .. } => {
+            basic.leave();
+        }
         Scanner::Vbase { vbase, .. } => {
             vbase.leave();
         }
@@ -87,40 +90,43 @@ pub unsafe fn next_scan(scan: pgrx::pg_sys::IndexScanDesc) -> bool {
         let node = node.expect("Hook failed.");
         let vector = vector.as_ref().expect("Scan failed.");
 
-        #[cfg(any(feature = "pg12", feature = "pg13", feature = "pg14", feature = "pg15"))]
+        #[cfg(any(feature = "pg14", feature = "pg15"))]
         let oid = (*(*scan).indexRelation).rd_node.relNode;
         #[cfg(feature = "pg16")]
         let oid = (*(*scan).indexRelation).rd_locator.relNumber;
-        let id = Id::from_sys(oid);
+        let id = Handle::from_sys(oid);
 
-        let mut rpc = crate::ipc::client::borrow_mut();
+        let rpc = check_client(crate::ipc::client());
 
-        if ENABLE_VBASE.get() {
-            let vbase = rpc.vbase(id, vector.clone());
-            *scanner = Scanner::Vbase { node, vbase };
-        } else {
-            let k = K.get() as _;
-            struct Search {
-                node: *mut pgrx::pg_sys::IndexScanState,
+        match SEARCH_MODE.get() {
+            Mode::basic => {
+                let opts = search_options();
+                let basic = match rpc.basic(id, vector.clone(), opts) {
+                    Ok(x) => x,
+                    Err((_, BasicError::NotExist)) => bad_service_not_exist(),
+                    Err((_, BasicError::Upgrade)) => bad_service_upgrade(),
+                    Err((_, BasicError::InvalidVector)) => bad_service_invalid_vector(),
+                    Err((_, BasicError::InvalidSearchOptions { reason: _ })) => unreachable!(),
+                };
+                *scanner = Scanner::Basic { node, basic };
             }
-
-            impl crate::ipc::client::Search for Search {
-                fn check(&mut self, p: Pointer) -> bool {
-                    unsafe { check(self.node, p) }
-                }
+            Mode::vbase => {
+                let opts = search_options();
+                let vbase = match rpc.vbase(id, vector.clone(), opts) {
+                    Ok(x) => x,
+                    Err((_, VbaseError::NotExist)) => bad_service_not_exist(),
+                    Err((_, VbaseError::Upgrade)) => bad_service_upgrade(),
+                    Err((_, VbaseError::InvalidVector)) => bad_service_invalid_vector(),
+                    Err((_, VbaseError::InvalidSearchOptions { reason: _ })) => unreachable!(),
+                };
+                *scanner = Scanner::Vbase { node, vbase };
             }
-
-            let search = Search { node };
-
-            let mut data = rpc.search(id, (vector.clone(), k), ENABLE_PREFILTER.get(), search);
-            data.reverse();
-            *scanner = Scanner::Search { node, data };
         }
     }
     match scanner {
         Scanner::Initial { .. } => unreachable!(),
-        Scanner::Search { data, .. } => {
-            if let Some(p) = data.pop() {
+        Scanner::Basic { basic, .. } => {
+            if let Some(p) = basic.next() {
                 (*scan).xs_heaptid = p.into_sys();
                 true
             } else {
@@ -150,13 +156,16 @@ pub unsafe fn end_scan(scan: pgrx::pg_sys::IndexScanDesc) {
 
     match scanner {
         Scanner::Initial { .. } => {}
-        Scanner::Search { .. } => {}
+        Scanner::Basic { basic, .. } => {
+            basic.leave();
+        }
         Scanner::Vbase { vbase, .. } => {
             vbase.leave();
         }
     }
 }
 
+#[allow(unused)]
 unsafe fn execute_boolean_qual(
     state: *mut pgrx::pg_sys::ExprState,
     econtext: *mut pgrx::pg_sys::ExprContext,
@@ -174,6 +183,7 @@ unsafe fn execute_boolean_qual(
     bool::from_datum(ret, is_null).unwrap()
 }
 
+#[allow(unused)]
 unsafe fn check_quals(node: *mut pgrx::pg_sys::IndexScanState) -> bool {
     let slot = (*node).ss.ss_ScanTupleSlot;
     let econtext = (*node).ss.ps.ps_ExprContext;
@@ -186,6 +196,7 @@ unsafe fn check_quals(node: *mut pgrx::pg_sys::IndexScanState) -> bool {
     execute_boolean_qual(state, econtext)
 }
 
+#[allow(unused)]
 unsafe fn check_mvcc(node: *mut pgrx::pg_sys::IndexScanState, p: Pointer) -> bool {
     let scan_desc = (*node).iss_ScanDesc;
     let heap_fetch = (*scan_desc).xs_heapfetch;
@@ -223,6 +234,7 @@ unsafe fn check_mvcc(node: *mut pgrx::pg_sys::IndexScanState, p: Pointer) -> boo
     false
 }
 
+#[allow(unused)]
 unsafe fn check(node: *mut pgrx::pg_sys::IndexScanState, p: Pointer) -> bool {
     if !check_mvcc(node, p) {
         return false;

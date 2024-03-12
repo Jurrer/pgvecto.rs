@@ -1,8 +1,10 @@
+#![allow(unsafe_op_in_unsafe_fn)]
+
 use crate::index::am_scan::Scanner;
 use std::ptr::null_mut;
 
 pub unsafe fn post_executor_start(query_desc: *mut pgrx::pg_sys::QueryDesc) {
-    // Before Postgres 16, type defination of `PlanstateTreeWalker` in the source code is incorrect.
+    // Before Postgres 16, type definition of `PlanstateTreeWalker` in the source code is incorrect.
     let planstate = (*query_desc).planstate;
     let context = null_mut();
     rewrite_plan_state(planstate, context);
@@ -51,7 +53,7 @@ unsafe extern "C" fn rewrite_plan_state(
             }
         }
     }
-    #[cfg(any(feature = "pg12", feature = "pg13", feature = "pg14", feature = "pg15"))]
+    #[cfg(any(feature = "pg14", feature = "pg15"))]
     {
         type PlanstateTreeWalker =
             unsafe extern "C" fn(*mut pgrx::pg_sys::PlanState, *mut libc::c_void) -> bool;

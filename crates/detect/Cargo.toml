@@ -4,5 +4,8 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-std_detect = { git = "https://github.com/tensorchord/stdarch.git", branch = "avx512fp16" }
-ctor = "0.2.6"
+rustix.workspace = true
+std_detect = { git = "https://github.com/tensorchord/stdarch.git", branch = "2024-03-04" }
+
+[lints]
+workspace = true

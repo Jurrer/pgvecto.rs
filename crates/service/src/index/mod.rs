@@ -4,25 +4,20 @@ pub mod optimizing;
 pub mod segments;
 
 use self::delete::Delete;
-use self::indexing::IndexingOptions;
-use self::optimizing::OptimizingOptions;
 use self::segments::growing::GrowingSegment;
-use self::segments::growing::GrowingSegmentInsertError;
 use self::segments::sealed::SealedSegment;
-use self::segments::SegmentsOptions;
-use crate::index::indexing::DynamicIndexIter;
 use crate::index::optimizing::indexing::OptimizerIndexing;
 use crate::index::optimizing::sealing::OptimizerSealing;
 use crate::prelude::*;
 use crate::utils::clean::clean;
 use crate::utils::dir_ops::sync_dir;
 use crate::utils::file_atomic::FileAtomic;
+use crate::utils::tournament_tree::LoserTree;
 use arc_swap::ArcSwap;
 use crossbeam::atomic::AtomicCell;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
-use std::collections::BinaryHeap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -34,41 +29,7 @@ use validator::Validate;
 
 #[derive(Debug, Error)]
 #[error("The index view is outdated.")]
-pub struct OutdatedError(#[from] pub Option<GrowingSegmentInsertError>);
-
-#[derive(Debug, Clone, Serialize, Deserialize, Validate)]
-#[serde(deny_unknown_fields)]
-pub struct VectorOptions {
-    #[validate(range(min = 1, max = 65535))]
-    #[serde(rename = "dimensions")]
-    pub dims: u16,
-    #[serde(rename = "distance")]
-    pub d: Distance,
-    #[serde(rename = "kind")]
-    pub k: Kind,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Validate)]
-#[serde(deny_unknown_fields)]
-pub struct IndexOptions {
-    #[validate]
-    pub vector: VectorOptions,
-    #[validate]
-    pub segment: SegmentsOptions,
-    #[validate]
-    pub optimizing: OptimizingOptions,
-    #[validate]
-    pub indexing: IndexingOptions,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct IndexStat {
-    pub indexing: bool,
-    pub sealed: Vec<u32>,
-    pub growing: Vec<u32>,
-    pub write: u32,
-    pub options: IndexOptions,
-}
+pub struct OutdatedError;
 
 pub struct Index<S: G> {
     path: PathBuf,
@@ -82,9 +43,18 @@ pub struct Index<S: G> {
 }
 
 impl<S: G> Index<S> {
-    pub fn create(path: PathBuf, options: IndexOptions) -> Arc<Self> {
-        assert!(options.validate().is_ok());
+    pub fn create(path: PathBuf, options: IndexOptions) -> Result<Arc<Self>, CreateError> {
+        if let Err(err) = options.validate() {
+            return Err(CreateError::InvalidIndexOptions {
+                reason: err.to_string(),
+            });
+        }
         std::fs::create_dir(&path).unwrap();
+        std::fs::write(
+            path.join("options"),
+            serde_json::to_string::<IndexOptions>(&options).unwrap(),
+        )
+        .unwrap();
         std::fs::create_dir(path.join("segments")).unwrap();
         let startup = FileAtomic::create(
             path.join("startup"),
@@ -118,9 +88,13 @@ impl<S: G> Index<S> {
         });
         OptimizerIndexing::new(index.clone()).spawn();
         OptimizerSealing::new(index.clone()).spawn();
-        index
+        Ok(index)
     }
-    pub fn open(path: PathBuf, options: IndexOptions) -> Arc<Self> {
+
+    pub fn open(path: PathBuf) -> Arc<Self> {
+        let options =
+            serde_json::from_slice::<IndexOptions>(&std::fs::read(path.join("options")).unwrap())
+                .unwrap();
         let tracker = Arc::new(IndexTracker { path: path.clone() });
         let startup = FileAtomic::<IndexStartup>::open(path.join("startup"));
         clean(
@@ -159,6 +133,7 @@ impl<S: G> Index<S> {
                         tracker.clone(),
                         path.join("segments").join(uuid.to_string()),
                         uuid,
+                        options.clone(),
                     ),
                 )
             })
@@ -234,10 +209,20 @@ impl<S: G> Index<S> {
         let view = self.view();
         IndexStat {
             indexing: self.instant_index.load() < self.instant_write.load(),
-            sealed: view.sealed.values().map(|x| x.len()).collect(),
-            growing: view.growing.values().map(|x| x.len()).collect(),
-            write: view.write.as_ref().map(|(_, x)| x.len()).unwrap_or(0),
             options: self.options().clone(),
+            segments: {
+                let mut segments = Vec::new();
+                for sealed in view.sealed.values() {
+                    segments.push(sealed.stat_sealed());
+                }
+                for growing in view.growing.values() {
+                    segments.push(growing.stat_growing());
+                }
+                if let Some(write) = view.write.as_ref().map(|(_, x)| x) {
+                    segments.push(write.stat_write());
+                }
+                segments
+            },
         }
     }
 }
@@ -266,206 +251,208 @@ pub struct IndexView<S: G> {
 }
 
 impl<S: G> IndexView<S> {
-    pub fn search<F: FnMut(Pointer) -> bool>(
-        &self,
-        k: usize,
-        vector: &[S::Scalar],
-        mut filter: F,
-    ) -> Vec<Pointer> {
-        assert_eq!(self.options.vector.dims as usize, vector.len());
+    pub fn basic<'a, F: Fn(Pointer) -> bool + Clone + 'a>(
+        &'a self,
+        vector: Borrowed<'_, S>,
+        opts: &'a SearchOptions,
+        filter: F,
+    ) -> Result<impl Iterator<Item = Pointer> + 'a, BasicError> {
+        if self.options.vector.dims != vector.dims() {
+            return Err(BasicError::InvalidVector);
+        }
+        if let Err(err) = opts.validate() {
+            return Err(BasicError::InvalidSearchOptions {
+                reason: err.to_string(),
+            });
+        }
 
-        struct Comparer(BinaryHeap<Reverse<HeapElement>>);
+        struct Comparer(std::collections::BinaryHeap<Reverse<Element>>);
 
-        impl PartialEq for Comparer {
-            fn eq(&self, other: &Self) -> bool {
-                self.cmp(other).is_eq()
+        impl Iterator for Comparer {
+            type Item = Element;
+
+            fn next(&mut self) -> Option<Self::Item> {
+                self.0.pop().map(|Reverse(x)| x)
             }
         }
 
-        impl Eq for Comparer {}
+        struct Filtering<'a, F: 'a> {
+            enable: bool,
+            delete: &'a Delete,
+            external: F,
+        }
 
-        impl PartialOrd for Comparer {
-            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-                Some(self.cmp(other))
+        impl<'a, F: Clone> Clone for Filtering<'a, F> {
+            fn clone(&self) -> Self {
+                Self {
+                    enable: self.enable,
+                    delete: self.delete,
+                    external: self.external.clone(),
+                }
             }
         }
 
-        impl Ord for Comparer {
-            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-                self.0.peek().cmp(&other.0.peek()).reverse()
+        impl<'a, F: FnMut(Pointer) -> bool + Clone> Filter for Filtering<'a, F> {
+            fn check(&mut self, payload: Payload) -> bool {
+                !self.enable
+                    || (self.delete.check(payload).is_some()
+                        && (self.external)(Pointer::from_u48(payload >> 16)))
             }
         }
 
-        let mut filter = |payload| {
-            if let Some(p) = self.delete.check(payload) {
-                filter(p)
-            } else {
-                false
-            }
+        let filter = Filtering {
+            enable: opts.prefilter_enable,
+            delete: &self.delete,
+            external: filter,
         };
+
         let n = self.sealed.len() + self.growing.len() + 1;
-        let mut result = Heap::new(k);
-        let mut heaps = BinaryHeap::with_capacity(1 + n);
+        let mut heaps = Vec::with_capacity(1 + n);
         for (_, sealed) in self.sealed.iter() {
-            let p = sealed.search(k, vector, &mut filter).into_reversed_heap();
+            let p = sealed.basic(vector, opts, filter.clone());
             heaps.push(Comparer(p));
         }
         for (_, growing) in self.growing.iter() {
-            let p = growing.search(k, vector, &mut filter).into_reversed_heap();
+            let p = growing.basic(vector, opts, filter.clone());
             heaps.push(Comparer(p));
         }
         if let Some((_, write)) = &self.write {
-            let p = write.search(k, vector, &mut filter).into_reversed_heap();
+            let p = write.basic(vector, opts, filter.clone());
             heaps.push(Comparer(p));
         }
-        while let Some(Comparer(mut heap)) = heaps.pop() {
-            if let Some(Reverse(x)) = heap.pop() {
-                result.push(x);
-                heaps.push(Comparer(heap));
+        let loser = LoserTree::new(heaps);
+        Ok(loser.filter_map(|x| {
+            if opts.prefilter_enable || self.delete.check(x.payload).is_some() {
+                Some(Pointer::from_u48(x.payload >> 16))
+            } else {
+                None
+            }
+        }))
+    }
+    pub fn vbase<'a, F: FnMut(Pointer) -> bool + Clone + 'a>(
+        &'a self,
+        vector: Borrowed<'a, S>,
+        opts: &'a SearchOptions,
+        filter: F,
+    ) -> Result<impl Iterator<Item = Pointer> + 'a, VbaseError> {
+        if self.options.vector.dims != vector.dims() {
+            return Err(VbaseError::InvalidVector);
+        }
+        if let Err(err) = opts.validate() {
+            return Err(VbaseError::InvalidSearchOptions {
+                reason: err.to_string(),
+            });
+        }
+
+        struct Filtering<'a, F: 'a> {
+            enable: bool,
+            delete: &'a Delete,
+            external: F,
+        }
+
+        impl<'a, F: Clone + 'a> Clone for Filtering<'a, F> {
+            fn clone(&self) -> Self {
+                Self {
+                    enable: self.enable,
+                    delete: self.delete,
+                    external: self.external.clone(),
+                }
             }
         }
-        result
-            .into_sorted_vec()
+
+        impl<'a, F: FnMut(Pointer) -> bool + Clone + 'a> Filter for Filtering<'a, F> {
+            fn check(&mut self, payload: Payload) -> bool {
+                !self.enable
+                    || (self.delete.check(payload).is_some()
+                        && (self.external)(Pointer::from_u48(payload >> 16)))
+            }
+        }
+
+        let filter = Filtering {
+            enable: opts.prefilter_enable,
+            delete: &self.delete,
+            external: filter,
+        };
+
+        let n = self.sealed.len() + self.growing.len() + 1;
+        let mut alpha = Vec::new();
+        let mut beta = Vec::with_capacity(1 + n);
+        for (_, sealed) in self.sealed.iter() {
+            let (stage1, stage2) = sealed.vbase(vector, opts, filter.clone());
+            alpha.extend(stage1);
+            beta.push(stage2);
+        }
+        for (_, growing) in self.growing.iter() {
+            let (stage1, stage2) = growing.vbase(vector, opts, filter.clone());
+            alpha.extend(stage1);
+            beta.push(stage2);
+        }
+        if let Some((_, write)) = &self.write {
+            let (stage1, stage2) = write.vbase(vector, opts, filter.clone());
+            alpha.extend(stage1);
+            beta.push(stage2);
+        }
+        alpha.sort_unstable();
+        beta.push(Box::new(alpha.into_iter()));
+        let loser = LoserTree::new(beta);
+        Ok(loser.filter_map(|x| {
+            if opts.prefilter_enable || self.delete.check(x.payload).is_some() {
+                Some(Pointer::from_u48(x.payload >> 16))
+            } else {
+                None
+            }
+        }))
+    }
+    pub fn list(&self) -> Result<impl Iterator<Item = Pointer> + '_, ListError> {
+        let sealed = self
+            .sealed
+            .values()
+            .flat_map(|x| (0..x.len()).map(|i| x.payload(i)));
+        let growing = self
+            .growing
+            .values()
+            .flat_map(|x| (0..x.len()).map(|i| x.payload(i)));
+        let write = self
+            .write
             .iter()
-            .map(|x| Pointer::from_u48(x.payload >> 16))
-            .collect()
+            .map(|(_, x)| x)
+            .flat_map(|x| (0..x.len()).map(|i| x.payload(i)));
+        let iter = sealed
+            .chain(growing)
+            .chain(write)
+            .filter_map(|p| self.delete.check(p));
+        Ok(iter)
     }
-    pub fn vbase(&self, vector: &[S::Scalar]) -> impl Iterator<Item = Pointer> + '_ {
-        assert_eq!(self.options.vector.dims as usize, vector.len());
-
-        let range = 86;
-
-        struct Comparer<'a, S: G> {
-            iter: ComparerIter<'a, S>,
-            item: Option<HeapElement>,
+    pub fn insert(
+        &self,
+        vector: Owned<S>,
+        pointer: Pointer,
+    ) -> Result<Result<(), OutdatedError>, InsertError> {
+        if self.options.vector.dims != vector.dims() {
+            return Err(InsertError::InvalidVector);
         }
 
-        enum ComparerIter<'a, S: G> {
-            Sealed(DynamicIndexIter<'a, S>),
-            Growing(std::vec::IntoIter<HeapElement>),
-        }
-
-        impl<S: G> PartialEq for Comparer<'_, S> {
-            fn eq(&self, other: &Self) -> bool {
-                self.cmp(other).is_eq()
-            }
-        }
-
-        impl<S: G> Eq for Comparer<'_, S> {}
-
-        impl<S: G> PartialOrd for Comparer<'_, S> {
-            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-                Some(self.cmp(other))
-            }
-        }
-
-        impl<S: G> Ord for Comparer<'_, S> {
-            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-                self.item.cmp(&other.item).reverse()
-            }
-        }
-
-        impl<S: G> Iterator for ComparerIter<'_, S> {
-            type Item = HeapElement;
-            fn next(&mut self) -> Option<Self::Item> {
-                match self {
-                    Self::Sealed(iter) => iter.next(),
-                    Self::Growing(iter) => iter.next(),
-                }
-            }
-        }
-
-        impl<S: G> Iterator for Comparer<'_, S> {
-            type Item = HeapElement;
-            fn next(&mut self) -> Option<Self::Item> {
-                let item = self.item.take();
-                self.item = self.iter.next();
-                item
-            }
-        }
-
-        fn from_iter<S: G>(mut iter: ComparerIter<'_, S>) -> Comparer<'_, S> {
-            let item = iter.next();
-            Comparer { iter, item }
-        }
-
-        use ComparerIter::*;
-        let filter = |payload| self.delete.check(payload).is_some();
-        let n = self.sealed.len() + self.growing.len() + 1;
-        let mut heaps: BinaryHeap<Comparer<S>> = BinaryHeap::with_capacity(1 + n);
-        for (_, sealed) in self.sealed.iter() {
-            let res = sealed.vbase(range, vector);
-            heaps.push(from_iter(Sealed(res)));
-        }
-        for (_, growing) in self.growing.iter() {
-            let mut res = growing.vbase(vector);
-            res.sort_unstable();
-            heaps.push(from_iter(Growing(res.into_iter())));
-        }
-        if let Some((_, write)) = &self.write {
-            let mut res = write.vbase(vector);
-            res.sort_unstable();
-            heaps.push(from_iter(Growing(res.into_iter())));
-        }
-        std::iter::from_fn(move || {
-            while let Some(mut iter) = heaps.pop() {
-                if let Some(x) = iter.next() {
-                    if !filter(x.payload) {
-                        continue;
-                    }
-                    heaps.push(iter);
-                    return Some(Pointer::from_u48(x.payload >> 16));
-                }
-            }
-            None
-        })
-    }
-    pub fn insert(&self, vector: Vec<S::Scalar>, pointer: Pointer) -> Result<(), OutdatedError> {
-        assert_eq!(self.options.vector.dims as usize, vector.len());
         let payload = (pointer.as_u48() << 16) | self.delete.version(pointer) as Payload;
         if let Some((_, growing)) = self.write.as_ref() {
-            Ok(growing.insert(vector, payload)?)
+            use crate::index::segments::growing::GrowingSegmentInsertError;
+            if let Err(GrowingSegmentInsertError) = growing.insert(vector, payload) {
+                return Ok(Err(OutdatedError));
+            }
+            Ok(Ok(()))
         } else {
-            Err(OutdatedError(None))
+            Ok(Err(OutdatedError))
         }
     }
-    pub fn delete<F: FnMut(Pointer) -> bool>(&self, mut f: F) {
-        for (_, sealed) in self.sealed.iter() {
-            let n = sealed.len();
-            for i in 0..n {
-                if let Some(p) = self.delete.check(sealed.payload(i)) {
-                    if f(p) {
-                        self.delete.delete(p);
-                    }
-                }
-            }
-        }
-        for (_, growing) in self.growing.iter() {
-            let n = growing.len();
-            for i in 0..n {
-                if let Some(p) = self.delete.check(growing.payload(i)) {
-                    if f(p) {
-                        self.delete.delete(p);
-                    }
-                }
-            }
-        }
-        if let Some((_, write)) = &self.write {
-            let n = write.len();
-            for i in 0..n {
-                if let Some(p) = self.delete.check(write.payload(i)) {
-                    if f(p) {
-                        self.delete.delete(p);
-                    }
-                }
-            }
-        }
+    pub fn delete(&self, p: Pointer) -> Result<(), DeleteError> {
+        self.delete.delete(p);
+        Ok(())
     }
-    pub fn flush(&self) {
+    pub fn flush(&self) -> Result<(), FlushError> {
         self.delete.flush();
         if let Some((_, write)) = &self.write {
             write.flush();
         }
+        Ok(())
     }
 }
 

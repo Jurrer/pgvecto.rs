@@ -2,11 +2,12 @@ use super::quantization::Quantization;
 use super::raw::Raw;
 use crate::index::segments::growing::GrowingSegment;
 use crate::index::segments::sealed::SealedSegment;
-use crate::index::IndexOptions;
 use crate::prelude::*;
 use crate::utils::dir_ops::sync_dir;
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::fs::create_dir;
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::Arc;
 
 pub struct Flat<S: G> {
@@ -15,36 +16,51 @@ pub struct Flat<S: G> {
 
 impl<S: G> Flat<S> {
     pub fn create(
-        path: PathBuf,
+        path: &Path,
         options: IndexOptions,
         sealed: Vec<Arc<SealedSegment<S>>>,
         growing: Vec<Arc<GrowingSegment<S>>>,
     ) -> Self {
-        create_dir(&path).unwrap();
-        let ram = make(path.clone(), sealed, growing, options.clone());
-        let mmap = save(ram, path.clone());
-        sync_dir(&path);
+        create_dir(path).unwrap();
+        let ram = make(path, sealed, growing, options);
+        let mmap = save(path, ram);
+        sync_dir(path);
         Self { mmap }
     }
-    pub fn open(path: PathBuf, options: IndexOptions) -> Self {
-        let mmap = load(path, options.clone());
+
+    pub fn open(path: &Path, options: IndexOptions) -> Self {
+        let mmap = open(path, options);
         Self { mmap }
+    }
+
+    pub fn basic(
+        &self,
+        vector: Borrowed<'_, S>,
+        _opts: &SearchOptions,
+        filter: impl Filter,
+    ) -> BinaryHeap<Reverse<Element>> {
+        basic(&self.mmap, vector, filter)
+    }
+
+    pub fn vbase<'a>(
+        &'a self,
+        vector: Borrowed<'a, S>,
+        _opts: &'a SearchOptions,
+        filter: impl Filter + 'a,
+    ) -> (Vec<Element>, Box<(dyn Iterator<Item = Element> + 'a)>) {
+        vbase(&self.mmap, vector, filter)
     }
 
     pub fn len(&self) -> u32 {
         self.mmap.raw.len()
     }
 
-    pub fn vector(&self, i: u32) -> &[S::Scalar] {
+    pub fn vector(&self, i: u32) -> Borrowed<'_, S> {
         self.mmap.raw.vector(i)
     }
 
     pub fn payload(&self, i: u32) -> Payload {
         self.mmap.raw.payload(i)
-    }
-
-    pub fn search(&self, k: usize, vector: &[S::Scalar], filter: &mut impl Filter) -> Heap {
-        search(&self.mmap, k, vector, filter)
     }
 }
 
@@ -65,39 +81,40 @@ unsafe impl<S: G> Send for FlatMmap<S> {}
 unsafe impl<S: G> Sync for FlatMmap<S> {}
 
 pub fn make<S: G>(
-    path: PathBuf,
+    path: &Path,
     sealed: Vec<Arc<SealedSegment<S>>>,
     growing: Vec<Arc<GrowingSegment<S>>>,
     options: IndexOptions,
 ) -> FlatRam<S> {
     let idx_opts = options.indexing.clone().unwrap_flat();
     let raw = Arc::new(Raw::create(
-        path.join("raw"),
+        &path.join("raw"),
         options.clone(),
         sealed,
         growing,
     ));
     let quantization = Quantization::create(
-        path.join("quantization"),
+        &path.join("quantization"),
         options.clone(),
         idx_opts.quantization,
         &raw,
+        (0..raw.len()).collect::<Vec<_>>(),
     );
     FlatRam { raw, quantization }
 }
 
-pub fn save<S: G>(ram: FlatRam<S>, _: PathBuf) -> FlatMmap<S> {
+pub fn save<S: G>(_: &Path, ram: FlatRam<S>) -> FlatMmap<S> {
     FlatMmap {
         raw: ram.raw,
         quantization: ram.quantization,
     }
 }
 
-pub fn load<S: G>(path: PathBuf, options: IndexOptions) -> FlatMmap<S> {
+pub fn open<S: G>(path: &Path, options: IndexOptions) -> FlatMmap<S> {
     let idx_opts = options.indexing.clone().unwrap_flat();
-    let raw = Arc::new(Raw::open(path.join("raw"), options.clone()));
+    let raw = Arc::new(Raw::open(&path.join("raw"), options.clone()));
     let quantization = Quantization::open(
-        path.join("quantization"),
+        &path.join("quantization"),
         options.clone(),
         idx_opts.quantization,
         &raw,
@@ -105,19 +122,34 @@ pub fn load<S: G>(path: PathBuf, options: IndexOptions) -> FlatMmap<S> {
     FlatMmap { raw, quantization }
 }
 
-pub fn search<S: G>(
+pub fn basic<S: G>(
     mmap: &FlatMmap<S>,
-    k: usize,
-    vector: &[S::Scalar],
-    filter: &mut impl Filter,
-) -> Heap {
-    let mut result = Heap::new(k);
+    vector: Borrowed<'_, S>,
+    mut filter: impl Filter,
+) -> BinaryHeap<Reverse<Element>> {
+    let mut result = BinaryHeap::new();
     for i in 0..mmap.raw.len() {
         let distance = mmap.quantization.distance(vector, i);
         let payload = mmap.raw.payload(i);
         if filter.check(payload) {
-            result.push(HeapElement { distance, payload });
+            result.push(Reverse(Element { distance, payload }));
         }
     }
     result
+}
+
+pub fn vbase<'a, S: G>(
+    mmap: &'a FlatMmap<S>,
+    vector: Borrowed<'a, S>,
+    mut filter: impl Filter + 'a,
+) -> (Vec<Element>, Box<dyn Iterator<Item = Element> + 'a>) {
+    let mut result = Vec::new();
+    for i in 0..mmap.raw.len() {
+        let distance = mmap.quantization.distance(vector, i);
+        let payload = mmap.raw.payload(i);
+        if filter.check(payload) {
+            result.push(Element { distance, payload });
+        }
+    }
+    (result, Box::new(std::iter::empty()))
 }

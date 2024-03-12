@@ -1,37 +1,68 @@
 pub mod mmap;
 pub mod unix;
 
-use super::IpcError;
+use super::ConnectionError;
 use serde::{Deserialize, Serialize};
 
-pub enum Socket {
+pub trait Packet: Sized {
+    fn serialize(&self) -> Option<Vec<u8>>;
+    fn deserialize(_: &[u8]) -> Option<Self>;
+}
+
+impl<T: Serialize + for<'a> Deserialize<'a>> Packet for T {
+    fn serialize(&self) -> Option<Vec<u8>> {
+        bincode::serialize(self).ok()
+    }
+
+    fn deserialize(bytes: &[u8]) -> Option<Self> {
+        bincode::deserialize(bytes).ok()
+    }
+}
+
+pub enum ServerSocket {
     Unix(unix::Socket),
     Mmap(mmap::Socket),
 }
 
-impl Socket {
-    pub fn client_send<T: Serialize>(&mut self, packet: T) -> Result<(), IpcError> {
+pub enum ClientSocket {
+    Unix(unix::Socket),
+    Mmap(mmap::Socket),
+}
+
+impl ServerSocket {
+    pub fn ok<T: Packet>(&mut self, packet: T) -> Result<(), ConnectionError> {
+        let buffer = packet
+            .serialize()
+            .ok_or(ConnectionError::BadSerialization)?;
         match self {
-            Socket::Unix(x) => x.send(packet),
-            Socket::Mmap(x) => x.send(packet),
+            Self::Unix(x) => x.send(&buffer),
+            Self::Mmap(x) => x.send(&buffer),
         }
     }
-    pub fn client_recv<T: for<'a> Deserialize<'a>>(&mut self) -> Result<T, IpcError> {
+    pub fn recv<T: Packet>(&mut self) -> Result<T, ConnectionError> {
+        let buffer = match self {
+            Self::Unix(x) => x.recv()?,
+            Self::Mmap(x) => x.recv()?,
+        };
+        T::deserialize(&buffer).ok_or(ConnectionError::BadDeserialization)
+    }
+}
+
+impl ClientSocket {
+    pub fn ok<T: Packet>(&mut self, packet: T) -> Result<(), ConnectionError> {
+        let buffer = packet
+            .serialize()
+            .ok_or(ConnectionError::BadSerialization)?;
         match self {
-            Socket::Unix(x) => x.recv(),
-            Socket::Mmap(x) => x.recv(),
+            Self::Unix(x) => x.send(&buffer),
+            Self::Mmap(x) => x.send(&buffer),
         }
     }
-    pub fn server_send<T: Serialize>(&mut self, packet: T) -> Result<(), IpcError> {
-        match self {
-            Socket::Unix(x) => x.send(packet),
-            Socket::Mmap(x) => x.send(packet),
-        }
-    }
-    pub fn server_recv<T: for<'a> Deserialize<'a>>(&mut self) -> Result<T, IpcError> {
-        match self {
-            Socket::Unix(x) => x.recv(),
-            Socket::Mmap(x) => x.recv(),
-        }
+    pub fn recv<T: Packet>(&mut self) -> Result<T, ConnectionError> {
+        let buffer = match self {
+            Self::Unix(x) => x.recv()?,
+            Self::Mmap(x) => x.recv()?,
+        };
+        T::deserialize(&buffer).ok_or(ConnectionError::BadDeserialization)
     }
 }

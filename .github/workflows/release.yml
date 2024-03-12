@@ -7,53 +7,38 @@ on:
         type: string
         description: Version
         required: true
-      prerelease:
-        type: boolean
-        description: Prerelease
+      tag:
+        type: string
+        description: Tag
         required: true
-        default: false
+
+concurrency:
+  group: ${{ github.ref }}-${{ github.workflow }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  SCCACHE_GHA_ENABLED: true
+  RUSTC_WRAPPER: sccache
+  RUSTFLAGS: "-Dwarnings"
 
 permissions:
   contents: write
   pull-requests: read
 
-env:
-  CARGO_TERM_COLOR: always
-  SCCACHE_GHA_ENABLED: true
-  RUSTC_WRAPPER: sccache
-
 jobs:
-  release:
-    runs-on: ubuntu-20.04
+  semver:
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v3
       - uses: actions/github-script@v7
         with:
           script: |
-            const r = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?/;
+            const r = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$/;
             if (!r.test("${{ github.event.inputs.version }}")) {
               core.setFailed(`Action failed with an invalid semver.`);
             }
-      - run: |
-          git config --global user.email "support@tensorchord.ai"
-          git config --global user.name "CI[bot]"
-      - run: ./scripts/ci_release.sh
-        env:
-          SEMVER: ${{ github.event.inputs.version }}
-      - id: create-release
-        uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: v${{ github.event.inputs.version }}
-          release_name: v${{ github.event.inputs.version }}
-          draft: false
-          prerelease: ${{ github.event.inputs.prerelease }}
-    outputs:
-      upload_url: ${{ steps.create-release.outputs.upload_url }}
   binary:
-    needs: ["release"]
     strategy:
       matrix:
         include:
@@ -64,69 +49,37 @@ jobs:
           - { version: 16, platform: amd64, arch: x86_64 }
           - { version: 16, platform: arm64, arch: aarch64 }
     runs-on: ubuntu-20.04
+    needs: ["semver"]
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
-        with:
-          ref: v${{ github.event.inputs.version }}
-      - uses: actions/cache/restore@v3
-        with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-          key: cargo-${{ runner.os }}-pg${{ matrix.version }}-${{ hashFiles('./Cargo.lock') }}
-          restore-keys: cargo-${{ runner.os }}-pg${{ matrix.version }}
-      - uses: mozilla-actions/sccache-action@v0.0.3
-      - name: Prepare
+        uses: actions/checkout@v4
+      - name: Set up Sccache
+        uses: mozilla-actions/sccache-action@v0.0.4
+      - name: Set up Crossbuild
+        if: ${{ matrix.arch == 'aarch64' }}
         run: |
-          sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" >> /etc/apt/sources.list.d/pgdg.list'
-          sudo sh -c 'echo "deb http://apt.llvm.org/$(lsb_release -cs)/ llvm-toolchain-$(lsb_release -cs)-16 main" >> /etc/apt/sources.list'
-          wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
-          wget --quiet -O - https://apt.llvm.org/llvm-snapshot.gpg.key | sudo apt-key add -
           sudo apt-get update
-          sudo apt-get -y install libpq-dev postgresql-${{ matrix.version }} postgresql-server-dev-${{ matrix.version }}
-          sudo apt-get -y install clang-16
-          cargo install cargo-pgrx --git https://github.com/tensorchord/pgrx.git --rev $(cat Cargo.toml | grep "pgrx =" | awk -F'rev = "' '{print $2}' | cut -d'"' -f1)
-          cargo pgrx init --pg${{ matrix.version }}=/usr/lib/postgresql/${{ matrix.version }}/bin/pg_config
-          if [[ "${{ matrix.arch }}" == "aarch64" ]]; then
-            sudo apt-get -y install crossbuild-essential-arm64
-            echo 'target.aarch64-unknown-linux-gnu.linker = "aarch64-linux-gnu-gcc"' | tee ~/.cargo/config.toml
-            echo 'env.BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_gnu = "-isystem /usr/aarch64-linux-gnu/include/ -ccc-gcc-name aarch64-linux-gnu-gcc"' | tee -a ~/.cargo/config.toml
-          fi
+          sudo apt-get -y install crossbuild-essential-arm64
+          echo 'target.aarch64-unknown-linux-gnu.linker = "aarch64-linux-gnu-gcc"' | tee ~/.cargo/config.toml
+          echo 'env.BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_gnu = "-isystem /usr/aarch64-linux-gnu/include/ -ccc-gcc-name aarch64-linux-gnu-gcc"' | tee -a ~/.cargo/config.toml
       - name: Build Release
         run: |
-          sudo apt-get -y install ruby-dev libarchive-tools
-          sudo gem install --no-document fpm
-          mkdir ./artifacts
-          cargo pgrx package
-          if [[ "${{ matrix.arch }}" == "aarch64" ]]; then
-            cargo build --target aarch64-unknown-linux-gnu --release --features "pg${{ matrix.version }}" --no-default-features
-            mv ./target/aarch64-unknown-linux-gnu/release/libvectors.so ./target/release/vectors-pg${{ matrix.version }}/usr/lib/postgresql/${{ matrix.version }}/lib/vectors.so
-          fi
-          mv ./target/release/vectors-pg${{ matrix.version }}/usr ./artifacts/usr
-          cd artifacts
-          fpm \
-            --input-type dir \
-            --output-type deb \
-            --name vectors-pg${{ matrix.version }} \
-            --version ${{ github.event.inputs.version }} \
-            --license apache2 \
-            --deb-no-default-config-files \
-            --package ../vectors-pg${{ matrix.version }}_${{ github.event.inputs.version }}_${{ matrix.platform }}.deb \
-            --architecture ${{ matrix.platform }} \
-            .
-      - name: Upload Release
-        uses: actions/upload-release-asset@v1
+          export SEMVER=${{ github.event.inputs.version }}
+          export VERSION=${{ matrix.version }}
+          export ARCH=${{ matrix.arch }}
+          export _PGRX=$(grep 'pgrx = {' Cargo.toml | cut -d '"' -f 2 | head -n 1)
+          export _RUST=$(grep -oP 'channel = "\K[^"]+' ./rust-toolchain.toml)
+          sudo -E ./scripts/build_0.sh
+          ./scripts/build_1.sh
+          ./scripts/build_2.sh
+      - name: Upload
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ needs.release.outputs.upload_url }}
-          asset_path: ./vectors-pg${{ matrix.version }}_${{ github.event.inputs.version }}_${{ matrix.platform }}.deb
-          asset_name: vectors-pg${{ matrix.version }}_${{ github.event.inputs.version }}_${{ matrix.platform }}.deb
-          asset_content_type: application/vnd.debian.binary-package
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload --clobber ${{ github.event.inputs.tag }} ./build/vectors-pg${{ matrix.version }}_${{ matrix.arch }}-unknown-linux-gnu_${{ github.event.inputs.version }}.zip
+          gh release upload --clobber ${{ github.event.inputs.tag }} ./build/vectors-pg${{ matrix.version }}_${{ github.event.inputs.version }}-1_${{ matrix.platform }}.deb
   docker_binary_release:
-    needs: ["release", "binary"]
+    needs: ["binary", "semver"]
     strategy:
       matrix:
         include:
@@ -136,14 +89,15 @@ jobs:
           - { version: 15, platform: arm64, arch: aarch64 }
           - { version: 16, platform: amd64, arch: x86_64 }
           - { version: 16, platform: arm64, arch: aarch64 }
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
-        with:
-          ref: v${{ github.event.inputs.version }}
+        uses: actions/checkout@v4
       - name: Download
-        run: wget -O pgvecto-rs-binary-release.deb https://github.com/tensorchord/pgvecto.rs/releases/download/v${{ github.event.inputs.version }}/vectors-pg${{ matrix.version }}_${{ github.event.inputs.version }}_${{ matrix.platform }}.deb
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download ${{ github.event.inputs.tag }} --pattern "vectors-pg${{ matrix.version }}_${{ github.event.inputs.version }}-1_${{ matrix.platform }}.deb" --output pgvecto-rs-binary-release.deb
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
       - name: Set up Docker Buildx
@@ -162,32 +116,25 @@ jobs:
           file: ./docker/binary_release.Dockerfile
           tags: tensorchord/pgvecto-rs-binary:pg${{ matrix.version }}-v${{ github.event.inputs.version }}-${{ matrix.platform }}
   docker_release:
-    needs: ["docker_binary_release"]
-    runs-on: ubuntu-20.04
+    needs: ["docker_binary_release", "semver"]
+    runs-on: ubuntu-latest
     strategy:
       matrix:
-        include:
-          - { version: 14, latest: false }
-          - { version: 15, latest: false }
-          - { version: 16, latest: true }
+        version: [14, 15, 16]
+        rootless: [true, false]
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
-        with:
-          ref: v${{ github.event.inputs.version }}
+        uses: actions/checkout@v4
       - name: Variables
         id: variables
-        uses: actions/github-script@v6
+        uses: actions/github-script@v7
         with:
           script: |
-            let tags = [
-              "tensorchord/pgvecto-rs:pg${{ matrix.version }}-v${{ github.event.inputs.version }}",
-              "tensorchord/pgvecto-rs:pg${{ matrix.version }}-latest",
-            ];
-            if ("${{ matrix.latest }}" == "true") {
-              tags.push("tensorchord/pgvecto-rs:latest");
+            if ("${{ matrix.rootless }}" == "true") {
+              core.setOutput('tags', "tensorchord/pgvecto-rs:pg${{ matrix.version }}-v${{ github.event.inputs.version }}-rootless");
+            } else {
+              core.setOutput('tags', "tensorchord/pgvecto-rs:pg${{ matrix.version }}-v${{ github.event.inputs.version }}");
             }
-            core.setOutput('tags', tags.join(", "));
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
       - name: Set up Docker Buildx
@@ -197,7 +144,8 @@ jobs:
         with:
           username: ${{ secrets.DOCKERIO_USERNAME }}
           password: ${{ secrets.DOCKERIO_TOKEN }}
-      - name: Push postgres with pgvecto.rs to Docker Registry
+      - name: Push postgres with pgvecto.rs to Docker Registry(rootful)
+        if: matrix.rootless == false
         uses: docker/build-push-action@v4
         with:
           context: .
@@ -205,6 +153,18 @@ jobs:
           platforms: "linux/amd64,linux/arm64"
           file: ./docker/pgvecto-rs.Dockerfile
           build-args: |
-            TAG=pg${{ matrix.version }}-v${{ github.event.inputs.version }}
+            FROM_TAG=pg${{ matrix.version }}-v${{ github.event.inputs.version }}
+            POSTGRES_VERSION=${{ matrix.version }}
+          tags: ${{ steps.variables.outputs.tags }}
+      - name: Push postgres with pgvecto.rs to Docker Registry(rootless)
+        if: matrix.rootless == true
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          push: true
+          platforms: "linux/amd64,linux/arm64"
+          file: ./docker/pgvecto-rs-rootless.Dockerfile
+          build-args: |
+            FROM_TAG=pg${{ matrix.version }}-v${{ github.event.inputs.version }}
             POSTGRES_VERSION=${{ matrix.version }}
           tags: ${{ steps.variables.outputs.tags }}

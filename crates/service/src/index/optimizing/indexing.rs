@@ -5,6 +5,7 @@ use crate::prelude::*;
 use std::cmp::Reverse;
 use std::sync::Arc;
 use std::time::Instant;
+use thiserror::Error;
 use uuid::Uuid;
 
 pub struct OptimizerIndexing<S: G> {
@@ -27,7 +28,7 @@ impl<S: G> OptimizerIndexing<S> {
             .build()
             .unwrap();
         let weak_index = Arc::downgrade(&index);
-        std::mem::drop(index);
+        drop(index);
         loop {
             {
                 let Some(index) = weak_index.upgrade() else {
@@ -76,7 +77,7 @@ impl<S: G> Seg<S> {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Error)]
 #[error("Interrupted, retry again.")]
 pub struct RetryError;
 
